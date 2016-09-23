@@ -4,26 +4,18 @@
 #include <WiFiClient.h>
 #include <ESP8266WebServer.h>
 #include <osapi.h>
+#include <FS.h>
 
 #define DBG_OUTPUT_PORT Serial
 
 #define _BYTE1(x) (  x        & 0xFF )
 #define _BYTE2(x) ( (x >>  8) & 0xFF )
-#define _BYTE3(x) ( (x >> 16) & 0xFF )
-#define _BYTE4(x) ( (x >> 24) & 0xFF )
-#define BYTE_SWAP_16(x) ((uint16_t)( _BYTE1(x)<<8 | _BYTE2(x) ))
-#define BYTE_SWAP_32(x) ((uint32_t)( _BYTE1(x)<<24 | _BYTE2(x)<<16 | _BYTE3(x)<<8 | _BYTE4(x) ))
-
-
-const char* ssid = "07056547823";
-const char* password = "0466369371";
 
 const char* host = "api.github.com";
 const int httpsPort = 443;
 
 #define FREQUENCY 8000
-#define DURATION 2000
-#define packsize FREQUENCY * DURATION / 1000 / 4
+#define DURATION 5000
 
 // Use web browser to view and copy
 // SHA1 fingerprint of the certificate
@@ -33,18 +25,12 @@ WiFiClientSecure client;
 
 ESP8266WebServer server(80);
 
-typedef struct {
-  uint16_t wav0 : 10;
-  uint16_t wav1 : 10;
-  uint16_t wav2 : 10;
-  uint16_t wav3 : 10;
-} WavPack;
-
-static WavPack wavData[packsize];
-
 int adc_bias = 0;
 
 static long toggle_counts;
+
+#define BUFSIZE 0b111111111111
+int16_t buffer[2][BUFSIZE+1];
 
 typedef void wdtfnuint32(uint32);
 static wdtfnuint32 *ets_delay_us = (wdtfnuint32 *)0x40002ecc;
@@ -58,52 +44,53 @@ void init_adc_bias() {
   adc_bias >>= 8;
 }
 
+File fd;
+
 ICACHE_RAM_ATTR void t1IntHandler() {
-  uint16_t sensorValue = analogRead(A0);
-  WavPack *slot = &wavData[toggle_counts / 4];
-  switch (toggle_counts & 3) {
-    case 0: slot->wav0 = sensorValue; break;
-    case 1: slot->wav1 = sensorValue; break;
-    case 2: slot->wav2 = sensorValue; break;
-    case 3: slot->wav3 = sensorValue; break;
-  }
-  toggle_counts--;
-  if (toggle_counts < 0) {
+  uint16_t sensorValue = analogRead(A0) - adc_bias;
+  buffer[0][toggle_counts&BUFSIZE]=sensorValue;
+//  fd.write(_BYTE1(sensorValue));
+//  fd.write(_BYTE2(sensorValue));
+  if (toggle_counts-- < 0) {
     stop_sampling();
   }
-}
-
-int decode(long c) {
-  WavPack *slot = &wavData[c / 4];
-  return ( ((c & 3) == 0) ? slot->wav0 :
-           ((c & 3) == 1) ? slot->wav1 :
-           ((c & 3) == 2) ? slot->wav2 :
-           ((c & 3) == 3) ? slot->wav3 : 99999) - adc_bias;
 }
 
 void stop_sampling() {
   timer1_disable();
   timer1_detachInterrupt();
-  Serial.println("stopped");
+  digitalWrite(13, LOW);
+  fd.close();
 }
 
 // frequency (in hertz) and duration (in milliseconds).
 void start_sampling(unsigned int frequency, unsigned long duration) {
   toggle_counts = frequency * (duration / 1000);
+  // preparing FS
+  if (!SPIFFS.begin()) {
+    Serial.println("SPIFFS.begin fail");
+    return;
+  }
+  fd = SPIFFS.open("/sample.wav", "w");
+  writeRiffHeader(&fd);
+  if (!fd) {
+    Serial.println("open error");
+    return;
+  }
+  pinMode(13, OUTPUT);
+  digitalWrite(13, HIGH);
+  // initialize timer
   timer1_disable();
   timer1_isr_init();
   timer1_attachInterrupt(t1IntHandler);
   timer1_enable(TIM_DIV1, TIM_EDGE, TIM_LOOP);
-  timer1_write((clockCyclesPerMicrosecond() * 500000) / frequency);
-  Serial.println(toggle_counts);
-  Serial.println("started");
+  timer1_write((clockCyclesPerMicrosecond() * 1000000) / frequency);
 }
 
 typedef void wdtfntype();
 static wdtfntype *ets_wdt_disable = (wdtfntype *)0x400030f0;
 static wdtfntype *ets_wdt_enable = (wdtfntype *)0x40002fa0;
 // static wdtfntype *ets_task=(wdtfntype *)0x40000dd0;
-
 
 void setup() {
   Serial.begin(115200);
@@ -120,7 +107,7 @@ void wifi_client() {
   // Wifi connect
   Serial.print("connecting to ");
   WiFi.mode(WIFI_AP_STA);
-  WiFi.begin(ssid, password);
+  WiFi.begin();
   // WiFi.begin();
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -179,26 +166,10 @@ void doGet() {
   html += "  <input type='text' name='pass' placeholder='pass'><br>";
   html += "  <input type='submit'><br>";
   html += "</form>";
+  html += "<a href='start'>start</a> ";
   html += "<a href='sample.wav'>sample.wav</a>";
   server.send(200, "text/html", html);
 }
-
-
-typedef union {
-  struct {
-    uint32_t long0;
-  };
-  struct {
-    uint16_t int1;
-    uint16_t int0;
-  };
-  struct {
-    uint8_t char3;
-    uint8_t char2;
-    uint8_t char1;
-    uint8_t char0;
-  };
-} Converter;
 
 struct {
   char riff[4];
@@ -216,9 +187,7 @@ struct {
   int32_t len2;
 } riff_header;
 
-
-void doGetWave() {
-
+void writeRiffHeader(Stream *fd) {
   int size = sizeof(riff_header) - 4 + 4 + FREQUENCY * (DURATION / 1000) * 2;
   strncpy(riff_header.riff, "RIFF", 4);
   riff_header.len1 = size;
@@ -232,28 +201,25 @@ void doGetWave() {
   riff_header.bytesPerBlock = 2;      // 16bit monoral -> 2byte
   riff_header.bitsPerSample = 16;
   strncpy(riff_header.data, "data", 4); // start of data chunk
-  riff_header.len2 = FREQUENCY * (DURATION / 1000); // wave data size
-
-  WiFiClient client = server.client();
-  client.print("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n");
-  client.write((uint8_t*)&riff_header, sizeof(riff_header));
-  int counts = FREQUENCY * (DURATION / 1000);
-  for (long c = counts; 0 <= c; c--) {
-    int sensorValue = decode(c);
-    // client.write(_BYTE2(sensorValue));
-    // client.write(_BYTE1(sensorValue));
-    Serial.println(sensorValue);
-  }
-  client.stop();
+  riff_header.len2 = FREQUENCY * (DURATION / 1000) * 2; // wave data size
+  fd->write((uint8_t*)&riff_header, sizeof(riff_header));
 }
 
+void doGetWave() {
+  File file = SPIFFS.open("/sample.wav", "r");
+  size_t sent = server.streamFile(file, "application/octet-stream");
+  file.close();
+}
+
+void startRecording() {
+  start_sampling(FREQUENCY, DURATION);
+  doGet();
+}
 
 void doPost() {
   String ssid = server.arg("ssid");
   String pass = server.arg("pass");
-  // WiFi.begin(ssid, password);
-
-
+  WiFi.begin(ssid.c_str(), pass.c_str());
   String html = "<h1>WiFi Settings</h1>";
   html += ssid + "<br>";
   html += pass + "<br>";
@@ -263,6 +229,7 @@ void doPost() {
 void webserver() {
   server.on("/", HTTP_GET, doGet);
   server.on("/sample.wav", HTTP_GET, doGetWave);
+  server.on("/start", HTTP_GET, startRecording);
   server.on("/", HTTP_POST, doPost);
   server.begin();
   Serial.println("HTTP server started.");
@@ -280,6 +247,7 @@ void loop() {
   // yield();
   start_sampling(FREQUENCY, DURATION);
   webserver();
+  Serial.println("loop end");
   delay(0);
   // delay(5000);
   // delayMicroseconds(125);
