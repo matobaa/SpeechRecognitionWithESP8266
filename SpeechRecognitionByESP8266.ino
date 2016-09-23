@@ -1,66 +1,93 @@
-#define _DEBUG_
-
+/* Flash mode: DIO
+ * Flash Freq: 40MHz
+ * CPU Freq: 80MHz
+ * Flash size: 512K (64K SPIFFS)
+ * Debug Port: Disabled
+ * Debug Level: Core
+ * Reset Method: ck
+ * Upload Speed: 115200
+ * Port: COM4
+ * 
+ */
+ 
 #include <ESP8266WiFi.h>
 #include <WiFiClient.h>
 #include <ESP8266WebServer.h>
 #include <osapi.h>
 #include <FS.h>
+#include <Ticker.h>
 
-#define DBG_OUTPUT_PORT Serial
+#ifdef DEBUG_ESP_PORT
+#define DEBUG_MSG(...) DEBUG_ESP_PORT.printf( __VA_ARGS__ )
+#else
+#define DEBUG_MSG(...)
+#endif
 
 #define _BYTE1(x) (  x        & 0xFF )
 #define _BYTE2(x) ( (x >>  8) & 0xFF )
 
-const char* host = "api.github.com";
-const int httpsPort = 443;
-
 #define FREQUENCY 8000
 #define DURATION 5000
+#define INDICATORPIN 13
 
+const char* host = "api.github.com";
+const int httpsPort = 443;
 // Use web browser to view and copy
 // SHA1 fingerprint of the certificate
 const char* fingerprint = "CF 05 98 89 CA FF 8E D8 5E 5C E0 C2 E4 F7 E6 C3 C7 50 DD 5C";
-// Use WiFiClientSecure class to create TLS connection
-WiFiClientSecure client;
 
+const char* ssid = "07056547823";
+const char* pass = "0466369371";
+
+WiFiClientSecure client;
 ESP8266WebServer server(80);
+Ticker bufferWriter;
+File fd;
+
+#define BUFBIT 12
+#define BUFSIZE (1<<BUFBIT)
+#define BUFMASK (BUFSIZE-1)
 
 int adc_bias = 0;
-
-static long toggle_counts;
-
-#define BUFSIZE 0b111111111111
-int16_t buffer[2][BUFSIZE+1];
+long toggle_counts;
+long counter = 0;
+int16_t buffer[2][BUFSIZE];
 
 typedef void wdtfnuint32(uint32);
 static wdtfnuint32 *ets_delay_us = (wdtfnuint32 *)0x40002ecc;
+typedef void wdtfntype();
+static wdtfntype *ets_wdt_disable = (wdtfntype *)0x400030f0;
+static wdtfntype *ets_wdt_enable = (wdtfntype *)0x40002fa0;
+// static wdtfntype *ets_task = (wdtfntype *)0x40000dd0;
 
 void init_adc_bias() {
-  int i;
-  for (i = 0; i < 1 << 8; i++) {
+  for (int i = 0; i < 1 << 8; i++) {
     adc_bias += analogRead(A0);
     os_delay_us(125);
   }
   adc_bias >>= 8;
 }
 
-File fd;
-
 ICACHE_RAM_ATTR void t1IntHandler() {
   uint16_t sensorValue = analogRead(A0) - adc_bias;
-  buffer[0][toggle_counts&BUFSIZE]=sensorValue;
-//  fd.write(_BYTE1(sensorValue));
-//  fd.write(_BYTE2(sensorValue));
-  if (toggle_counts-- < 0) {
+  buffer[(counter >> BUFBIT) & 1][counter & BUFMASK] = sensorValue;
+  counter++;
+  if ((counter & BUFMASK) == 0) { // overflow
+    digitalWrite(INDICATORPIN, LOW);
+  }
+  if (counter > toggle_counts) {
     stop_sampling();
   }
 }
 
-void stop_sampling() {
-  timer1_disable();
-  timer1_detachInterrupt();
-  digitalWrite(13, LOW);
-  fd.close();
+void flush_buffer() {
+  if (digitalRead(INDICATORPIN) == HIGH) return; // do nothing
+  DEBUG_MSG("Flushing Buffer:%d %d\n", 1 - (counter >> BUFBIT) & 1, 1 << (BUFBIT+1));
+  int result = fd.write((uint8_t*)buffer[1 - (counter >> BUFBIT) & 1], 1 << (BUFBIT+1));
+  if(!result) {
+//    Serial.println(SPIFFS_errno(&fd));
+  }
+  digitalWrite(INDICATORPIN, HIGH);
 }
 
 // frequency (in hertz) and duration (in milliseconds).
@@ -71,15 +98,20 @@ void start_sampling(unsigned int frequency, unsigned long duration) {
     Serial.println("SPIFFS.begin fail");
     return;
   }
+  SPIFFS.format();
   fd = SPIFFS.open("/sample.wav", "w");
-  writeRiffHeader(&fd);
   if (!fd) {
     Serial.println("open error");
     return;
   }
-  pinMode(13, OUTPUT);
-  digitalWrite(13, HIGH);
+  writeRiffHeader(&fd);
+  pinMode(INDICATORPIN, OUTPUT);
+  digitalWrite(INDICATORPIN, HIGH);
+  DEBUG_MSG("Sampling Started\n");
+  // initialize buffer writer
+  bufferWriter.attach(0.1, flush_buffer);
   // initialize timer
+  counter = 0;
   timer1_disable();
   timer1_isr_init();
   timer1_attachInterrupt(t1IntHandler);
@@ -87,10 +119,16 @@ void start_sampling(unsigned int frequency, unsigned long duration) {
   timer1_write((clockCyclesPerMicrosecond() * 1000000) / frequency);
 }
 
-typedef void wdtfntype();
-static wdtfntype *ets_wdt_disable = (wdtfntype *)0x400030f0;
-static wdtfntype *ets_wdt_enable = (wdtfntype *)0x40002fa0;
-// static wdtfntype *ets_task=(wdtfntype *)0x40000dd0;
+void stop_sampling() {
+  timer1_disable();
+  timer1_detachInterrupt();
+  bufferWriter.detach();
+  DEBUG_MSG("Flushing Buffer:%d %d\n", (counter >> BUFBIT) & 1, (counter & BUFMASK) * 2 - 2);
+  fd.write((uint8_t*)buffer[(counter >> BUFBIT) & 1], (counter & BUFMASK) * 2 - 2);
+  digitalWrite(INDICATORPIN, LOW);
+  DEBUG_MSG("Sampling Finished\n");
+  fd.close();
+}
 
 void setup() {
   Serial.begin(115200);
@@ -107,7 +145,7 @@ void wifi_client() {
   // Wifi connect
   Serial.print("connecting to ");
   WiFi.mode(WIFI_AP_STA);
-  WiFi.begin();
+  WiFi.begin(ssid, pass);
   // WiFi.begin();
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -241,15 +279,11 @@ void webserver() {
 
 // the loop routine runs over and over again forever:
 void loop() {
-  //t1IntHandler();
-  //os_delay_us(125);
-  //  ets_task();
-  // yield();
   start_sampling(FREQUENCY, DURATION);
+  delay(5000);
   webserver();
   Serial.println("loop end");
   delay(0);
-  // delay(5000);
   // delayMicroseconds(125);
 }
 
