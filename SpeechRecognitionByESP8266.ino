@@ -1,3 +1,4 @@
+#include <GDBStub.h>
 
 /* Flash mode: DIO
    Flash Freq: 40MHz
@@ -11,7 +12,6 @@
 
 #include <ESP8266HTTPClient.h>
 #include <ESP8266WebServer.h>
-// #include <osapi.h>
 #include <FS.h>
 #include <Ticker.h>
 
@@ -94,7 +94,6 @@ void start_sampling(unsigned int frequency, unsigned long duration) {
   toggle_counts = frequency * (duration / 1000);
   // preparing FS
 
-  SPIFFS.format();
   fd = SPIFFS.open("/sample.wav", "w");
   if (!fd) {
     Serial.println("open error");
@@ -285,7 +284,9 @@ void setup() {
     Serial.println("SPIFFS.begin fail");
     return;
   }
-  ets_wdt_disable();
+  SPIFFS.format();
+
+  ESP.wdtDisable();
 
   //   start_sampling(FREQUENCY, DURATION);
   delay(5000);
